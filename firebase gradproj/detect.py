@@ -17,12 +17,11 @@ CONFIRM_SECS  = 2.0
 SAVE_COOLDOWN = 30.0
 
 # ── Fire model (object detection, 640px) ──────────────────────────
-FIRE_CONF_DISPLAY = 0.35   # show box at this confidence
-FIRE_IMGSZ        = 640
-FIRE_IGNORE       = {"default"}
-FIRE_MAX_AREA     = 0.65   # reject boxes covering > 65% of frame (background walls)
-FIRE_EDGE_MARGIN  = 2      # reject boxes that bleed from the very frame edge
-FIRE_STICKY_FRAMES = 6     # keep showing last box for N frames after detection lost
+FIRE_CONF_DISPLAY  = 0.30   # low enough to catch smoke (more diffuse, lower conf)
+FIRE_IMGSZ         = 640
+FIRE_IGNORE        = {"default"}
+FIRE_MAX_AREA      = 0.65   # reject boxes covering > 65% of frame (background walls)
+FIRE_STICKY_FRAMES = 6      # keep showing last box for N frames after detection lost
 
 # ── Plant model (classification, 256px) ───────────────────────────
 PLANT_CONF_DISPLAY = 0.60
@@ -119,8 +118,6 @@ def _fire_worker():
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
             if (x2 - x1) * (y2 - y1) / frame_area > FIRE_MAX_AREA:
-                continue
-            if x1 <= FIRE_EDGE_MARGIN or x2 >= (fw - FIRE_EDGE_MARGIN):
                 continue
             valid.append([x1, y1, x2, y2, label, conf])
 
