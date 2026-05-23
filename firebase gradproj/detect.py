@@ -1,7 +1,6 @@
 import cv2
 import time
 import threading
-import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
 
@@ -18,12 +17,12 @@ CONFIRM_SECS  = 2.0    # seconds detection must hold before uploading
 SAVE_COOLDOWN = 30.0   # seconds between uploads for the same model
 
 # ── Fire model (object detection, 640px) ──────────────────────────
-FIRE_CONF_DISPLAY = 0.25   # show box on screen at this confidence
+FIRE_CONF_DISPLAY = 0.25
 FIRE_IMGSZ        = 640
 FIRE_IGNORE       = {"default"}
 
 # ── Plant model (classification, 256px) ───────────────────────────
-PLANT_CONF_DISPLAY = 0.60   # show label on screen at this confidence
+PLANT_CONF_DISPLAY = 0.60
 PLANT_IMGSZ        = 256
 PLANT_GREEN_THRESH = 0.08   # minimum green pixel ratio to run plant model
 
@@ -31,18 +30,30 @@ PLANT_GREEN_THRESH = 0.08   # minimum green pixel ratio to run plant model
 GPS_LAT = 32.0123
 GPS_LNG = 36.1234
 
-# ── Shared state ──────────────────────────────────────────────────
-_raw_frame    = None      # latest camera frame (BGR)
-_raw_frame_id = 0         # monotonically increasing; workers skip unchanged frames
+# ── Shared: raw camera frame ──────────────────────────────────────
+# Main thread writes; workers read. Workers copy immediately under lock
+# so inference runs outside the lock.
+_raw_frame    = None
+_raw_frame_id = 0
 _raw_lock     = threading.Lock()
 
-_annotated       = None   # frame with fire+plant drawings overlaid
-_annotated_lock  = threading.Lock()
+# ── Shared: annotation data (workers write, main draws) ───────────
+# Workers store the RESULT of inference as plain data.
+# Main thread draws this data onto the fresh live frame each cycle.
+# This is what keeps the camera live and boxes tracking.
+_fire_boxes  = []      # list of [x1, y1, x2, y2, label, conf]
+_fire_alock  = threading.Lock()
+
+_plant_state = [None]  # [0] = (label, conf) or None
+_plant_alock = threading.Lock()
 
 _stop = threading.Event()
 
-def upload_to_firebase(model_name: str, label: str, confidence: float,
-                       frame, bbox):
+
+# ─────────────────────────────────────────────────────────────────
+# FIREBASE UPLOAD
+# ─────────────────────────────────────────────────────────────────
+def upload_to_firebase(model_name, label, confidence, frame, bbox):
     try:
         if model_name == "fire":
             handle_detection(
@@ -62,16 +73,17 @@ def upload_to_firebase(model_name: str, label: str, confidence: float,
                 confidence=confidence,
                 gps_lat=GPS_LAT,
                 gps_lng=GPS_LNG,
-                bbox=None,   # plant model has no bbox — uploads full frame crop
+                bbox=None,
             )
             print(f"[Firebase] plant uploaded: {label} {confidence:.0%}")
     except Exception as exc:
         print(f"[Firebase ERROR] {model_name}: {exc}")
 
 
+# ─────────────────────────────────────────────────────────────────
+# FIRE WORKER  (object detection — has bounding boxes)
+# ─────────────────────────────────────────────────────────────────
 def _fire_worker():
-    global _annotated
-
     print("[fire] Loading model...")
     model = YOLO(str(MODEL_FIRE))
     print(f"[fire] Ready. Classes: {list(model.names.values())}")
@@ -90,45 +102,35 @@ def _fire_worker():
             continue
         last_seen_id = fid
 
-        results = model(frame, conf=FIRE_CONF_DISPLAY, imgsz=FIRE_IMGSZ,
-                        verbose=False)
+        results = model(frame, conf=FIRE_CONF_DISPLAY, imgsz=FIRE_IMGSZ, verbose=False)
         result  = results[0]
 
-        # Start from latest annotated frame so plant labels are preserved
-        with _annotated_lock:
-            base = _annotated.copy() if _annotated is not None else frame.copy()
-
-        valid_boxes = []
+        boxes_data = []
         for box in result.boxes:
             cls_id = int(box.cls[0])
             label  = result.names[cls_id]
             if label.lower() in FIRE_IGNORE:
                 continue
-            valid_boxes.append(box)
-
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
-            cv2.rectangle(base, (x1, y1), (x2, y2), (0, 60, 255), 2)
-            cv2.putText(base, f"{label} {conf:.2f}",
-                        (x1, max(y1 - 8, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 60, 255), 2)
+            boxes_data.append([x1, y1, x2, y2, label, conf])
 
-        with _annotated_lock:
-            _annotated = base
+        # Store annotation data — main thread draws it on the live frame
+        with _fire_alock:
+            _fire_boxes.clear()
+            _fire_boxes.extend(boxes_data)
 
         now = time.time()
 
-        if not valid_boxes:
+        if not boxes_data:
             if first_detected is not None:
                 print("[fire] Lost — timer reset")
             first_detected = None
             continue
 
-        best_box  = max(valid_boxes, key=lambda b: float(b.conf[0]))
-        best_conf = float(best_box.conf[0])
-        cls_id    = int(best_box.cls[0])
-        best_label = result.names[cls_id]
-        bbox       = best_box.xyxy[0].tolist()
+        best = max(boxes_data, key=lambda b: b[5])
+        x1, y1, x2, y2, best_label, best_conf = best
+        bbox = [x1, y1, x2, y2]
 
         if best_conf < CONF_UPLOAD:
             first_detected = None
@@ -152,9 +154,10 @@ def _fire_worker():
             print(f"[fire] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s")
 
 
+# ─────────────────────────────────────────────────────────────────
+# PLANT WORKER  (classification — NO bounding boxes)
+# ─────────────────────────────────────────────────────────────────
 def _plant_worker():
-    global _annotated
-
     print("[plant] Loading model...")
     model = YOLO(str(MODEL_PLANT))
     print(f"[plant] Ready. Classes: {list(model.names.values())}")
@@ -173,12 +176,14 @@ def _plant_worker():
             continue
         last_seen_id = fid
 
-        # Vegetation gate — skip non-plant scenes
+        # Vegetation gate — only classify if scene is green enough
         hsv         = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         green_mask  = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
         green_ratio = green_mask.sum() / 255 / (frame.shape[0] * frame.shape[1])
 
         if green_ratio < PLANT_GREEN_THRESH:
+            with _plant_alock:
+                _plant_state[0] = None
             if first_detected is not None:
                 print("[plant] Not green enough — timer reset")
             first_detected = None
@@ -197,24 +202,16 @@ def _plant_worker():
         now = time.time()
 
         if top1_conf < PLANT_CONF_DISPLAY:
+            with _plant_alock:
+                _plant_state[0] = None
             if first_detected is not None:
                 print("[plant] Low conf — timer reset")
             first_detected = None
             continue
 
-        # Draw label banner on top of the current annotated frame
-        with _annotated_lock:
-            base = _annotated.copy() if _annotated is not None else frame.copy()
-
-        clean = label.replace("___", " ").replace("_", " ")
-        text  = f"{clean}  {top1_conf:.0%}"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
-        cv2.rectangle(base, (8, 8), (8 + tw + 10, 8 + th + 12), (0, 0, 0), -1)
-        cv2.putText(base, text, (13, 8 + th + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 60), 2)
-
-        with _annotated_lock:
-            _annotated = base
+        # Store annotation data — main thread draws it on the live frame
+        with _plant_alock:
+            _plant_state[0] = (label, top1_conf)
 
         if top1_conf < CONF_UPLOAD:
             first_detected = None
@@ -238,8 +235,37 @@ def _plant_worker():
             print(f"[plant] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s")
 
 
+# ─────────────────────────────────────────────────────────────────
+# DRAW  — called by main on a fresh frame every cycle
+# ─────────────────────────────────────────────────────────────────
+def _draw(frame):
+    with _fire_alock:
+        boxes = list(_fire_boxes)
+
+    for x1, y1, x2, y2, label, conf in boxes:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 60, 255), 2)
+        cv2.putText(frame, f"{label} {conf:.2f}",
+                    (x1, max(y1 - 8, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 60, 255), 2)
+
+    with _plant_alock:
+        plant = _plant_state[0]
+
+    if plant is not None:
+        label, conf = plant
+        clean = label.replace("___", " ").replace("_", " ")
+        text  = f"{clean}  {conf:.0%}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+        cv2.rectangle(frame, (8, 8), (8 + tw + 10, 8 + th + 12), (0, 0, 0), -1)
+        cv2.putText(frame, text, (13, 8 + th + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 60), 2)
+
+
+# ─────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────
 def main():
-    global _raw_frame, _raw_frame_id, _annotated
+    global _raw_frame, _raw_frame_id
 
     for name, path in [("Fire", MODEL_FIRE), ("Plant", MODEL_PLANT)]:
         if not path.exists():
@@ -270,15 +296,10 @@ def main():
             _raw_frame     = frame.copy()
             _raw_frame_id += 1
 
-        # Seed annotated frame each cycle so workers always have a fresh base
-        with _annotated_lock:
-            if _annotated is None:
-                _annotated = frame.copy()
+        # Draw latest annotation data onto the fresh live frame
+        _draw(frame)
 
-        with _annotated_lock:
-            display = _annotated.copy()
-
-        cv2.imshow("AgroSentinel", display)
+        cv2.imshow("AgroSentinel", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
