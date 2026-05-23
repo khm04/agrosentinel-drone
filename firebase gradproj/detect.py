@@ -40,3 +40,30 @@ _annotated       = None   # frame with fire+plant drawings overlaid
 _annotated_lock  = threading.Lock()
 
 _stop = threading.Event()
+
+def upload_to_firebase(model_name: str, label: str, confidence: float,
+                       frame, bbox):
+    try:
+        if model_name == "fire":
+            handle_detection(
+                frame=frame,
+                bbox=bbox,
+                anomaly_type="fire",
+                confidence=confidence,
+                gps_lat=GPS_LAT,
+                gps_lng=GPS_LNG,
+                label=label,
+            )
+            print(f"[Firebase] fire uploaded: {label} {confidence:.0%}")
+        elif model_name == "plant":
+            handle_disease_classification(
+                frame=frame,
+                disease_name=label,
+                confidence=confidence,
+                gps_lat=GPS_LAT,
+                gps_lng=GPS_LNG,
+                bbox=None,   # plant model has no bbox — uploads full frame crop
+            )
+            print(f"[Firebase] plant uploaded: {label} {confidence:.0%}")
+    except Exception as exc:
+        print(f"[Firebase ERROR] {model_name}: {exc}")
