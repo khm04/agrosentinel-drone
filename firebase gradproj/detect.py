@@ -67,3 +67,86 @@ def upload_to_firebase(model_name: str, label: str, confidence: float,
             print(f"[Firebase] plant uploaded: {label} {confidence:.0%}")
     except Exception as exc:
         print(f"[Firebase ERROR] {model_name}: {exc}")
+
+
+def _fire_worker():
+    global _annotated
+
+    print("[fire] Loading model...")
+    model = YOLO(str(MODEL_FIRE))
+    print(f"[fire] Ready. Classes: {list(model.names.values())}")
+
+    last_seen_id   = -1
+    first_detected = None
+    last_uploaded  = 0.0
+
+    while not _stop.is_set():
+        with _raw_lock:
+            fid   = _raw_frame_id
+            frame = _raw_frame.copy() if _raw_frame is not None else None
+
+        if frame is None or fid == last_seen_id:
+            time.sleep(0.005)
+            continue
+        last_seen_id = fid
+
+        results = model(frame, conf=FIRE_CONF_DISPLAY, imgsz=FIRE_IMGSZ,
+                        verbose=False)
+        result  = results[0]
+
+        # Start from latest annotated frame so plant labels are preserved
+        with _annotated_lock:
+            base = _annotated.copy() if _annotated is not None else frame.copy()
+
+        valid_boxes = []
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            label  = result.names[cls_id]
+            if label.lower() in FIRE_IGNORE:
+                continue
+            valid_boxes.append(box)
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            conf = float(box.conf[0])
+            cv2.rectangle(base, (x1, y1), (x2, y2), (0, 60, 255), 2)
+            cv2.putText(base, f"{label} {conf:.2f}",
+                        (x1, max(y1 - 8, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 60, 255), 2)
+
+        with _annotated_lock:
+            _annotated = base
+
+        now = time.time()
+
+        if not valid_boxes:
+            if first_detected is not None:
+                print("[fire] Lost — timer reset")
+            first_detected = None
+            continue
+
+        best_box  = max(valid_boxes, key=lambda b: float(b.conf[0]))
+        best_conf = float(best_box.conf[0])
+        cls_id    = int(best_box.cls[0])
+        best_label = result.names[cls_id]
+        bbox       = best_box.xyxy[0].tolist()
+
+        if best_conf < CONF_UPLOAD:
+            first_detected = None
+            continue
+
+        if first_detected is None:
+            first_detected = now
+            print(f"[fire] Detected {best_label} {best_conf:.0%} — confirming...")
+
+        elapsed = now - first_detected
+        if elapsed >= CONFIRM_SECS and (now - last_uploaded) >= SAVE_COOLDOWN:
+            print(f"[fire] Confirmed {elapsed:.1f}s — uploading...")
+            threading.Thread(
+                target=upload_to_firebase,
+                args=("fire", best_label, best_conf, frame, bbox),
+                daemon=True,
+            ).start()
+            last_uploaded  = now
+            first_detected = None
+        elif elapsed < CONFIRM_SECS:
+            print(f"[fire] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s")
