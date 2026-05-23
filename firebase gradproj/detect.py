@@ -132,13 +132,17 @@ def _fire_worker():
         x1, y1, x2, y2, best_label, best_conf = best
         bbox = [x1, y1, x2, y2]
 
-        if best_conf < CONF_UPLOAD:
-            first_detected = None
-            continue
-
+        # Start timer when detection first appears; keep it running even if
+        # confidence dips briefly below CONF_UPLOAD — only reset on total loss.
         if first_detected is None:
             first_detected = now
             print(f"[fire] Detected {best_label} {best_conf:.0%} — confirming...")
+
+        # Only upload if confidence is above threshold at the moment of upload
+        if best_conf < CONF_UPLOAD:
+            elapsed = now - first_detected
+            print(f"[fire] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s (conf {best_conf:.0%})")
+            continue
 
         elapsed = now - first_detected
         if elapsed >= CONFIRM_SECS and (now - last_uploaded) >= SAVE_COOLDOWN:
@@ -213,13 +217,16 @@ def _plant_worker():
         with _plant_alock:
             _plant_state[0] = (label, top1_conf)
 
-        if top1_conf < CONF_UPLOAD:
-            first_detected = None
-            continue
-
+        # Start timer when detection first appears; keep it running even if
+        # confidence dips briefly below CONF_UPLOAD — only reset on total loss.
         if first_detected is None:
             first_detected = now
             print(f"[plant] Detected {label} {top1_conf:.0%} — confirming...")
+
+        if top1_conf < CONF_UPLOAD:
+            elapsed = now - first_detected
+            print(f"[plant] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s (conf {top1_conf:.0%})")
+            continue
 
         elapsed = now - first_detected
         if elapsed >= CONFIRM_SECS and (now - last_uploaded) >= SAVE_COOLDOWN:

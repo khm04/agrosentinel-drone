@@ -81,6 +81,7 @@ def upload_image(local_path, anomaly_type):
 
     blob = bucket.blob(storage_path)
     blob.upload_from_filename(local_path)
+    os.remove(local_path)
 
     return storage_path, storage_path
 
@@ -148,3 +149,37 @@ def handle_disease_classification(frame, disease_name, confidence, gps_lat, gps_
 
     except Exception as e:
         print(f"Error while handling disease classification: {e}")
+
+
+def handle_detection(frame, bbox, anomaly_type, confidence, gps_lat, gps_lng, label=None):
+    """
+    Handle fire detection result.
+    Crops the bounding box region and uploads to Firebase.
+    """
+    try:
+        local_path, filename = save_crop(frame, bbox)
+        storage_path, image_url = upload_image(local_path, anomaly_type)
+
+        extra = {
+            "source_file": filename,
+            "saved_mode": "crop",
+            "bbox": [int(v) for v in bbox],
+        }
+        if label:
+            extra["label"] = label
+
+        log_event(
+            anomaly_type=anomaly_type,
+            confidence=confidence,
+            gps_lat=gps_lat,
+            gps_lng=gps_lng,
+            image_url=image_url,
+            storage_path=storage_path,
+            extra=extra,
+        )
+
+        print(f"✅ {anomaly_type} uploaded successfully: {label}")
+        print(f"Storage path: {storage_path}")
+
+    except Exception as e:
+        print(f"Error while handling detection: {e}")
