@@ -236,3 +236,58 @@ def _plant_worker():
             first_detected = None
         elif elapsed < CONFIRM_SECS:
             print(f"[plant] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s")
+
+
+def main():
+    global _raw_frame, _raw_frame_id, _annotated
+
+    for name, path in [("Fire", MODEL_FIRE), ("Plant", MODEL_PLANT)]:
+        if not path.exists():
+            print(f"[ERROR] {name} model not found: {path}")
+            return
+
+    threading.Thread(target=_fire_worker,  daemon=True).start()
+    threading.Thread(target=_plant_worker, daemon=True).start()
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Cannot open camera.")
+        return
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    print("\nAgroSentinel running — press Q to quit.")
+    print(f"Upload threshold : {CONF_UPLOAD:.0%}")
+    print(f"Confirm window   : {CONFIRM_SECS}s")
+    print(f"Save cooldown    : {SAVE_COOLDOWN}s\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[ERROR] Camera read failed.")
+            break
+
+        with _raw_lock:
+            _raw_frame     = frame.copy()
+            _raw_frame_id += 1
+
+        # Seed annotated frame each cycle so workers always have a fresh base
+        with _annotated_lock:
+            if _annotated is None:
+                _annotated = frame.copy()
+
+        with _annotated_lock:
+            display = _annotated.copy()
+
+        cv2.imshow("AgroSentinel", display)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    _stop.set()
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Stopped.")
+
+
+if __name__ == "__main__":
+    main()
