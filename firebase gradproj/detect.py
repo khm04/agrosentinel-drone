@@ -150,3 +150,89 @@ def _fire_worker():
             first_detected = None
         elif elapsed < CONFIRM_SECS:
             print(f"[fire] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s")
+
+
+def _plant_worker():
+    global _annotated
+
+    print("[plant] Loading model...")
+    model = YOLO(str(MODEL_PLANT))
+    print(f"[plant] Ready. Classes: {list(model.names.values())}")
+
+    last_seen_id   = -1
+    first_detected = None
+    last_uploaded  = 0.0
+
+    while not _stop.is_set():
+        with _raw_lock:
+            fid   = _raw_frame_id
+            frame = _raw_frame.copy() if _raw_frame is not None else None
+
+        if frame is None or fid == last_seen_id:
+            time.sleep(0.005)
+            continue
+        last_seen_id = fid
+
+        # Vegetation gate — skip non-plant scenes
+        hsv         = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        green_mask  = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
+        green_ratio = green_mask.sum() / 255 / (frame.shape[0] * frame.shape[1])
+
+        if green_ratio < PLANT_GREEN_THRESH:
+            if first_detected is not None:
+                print("[plant] Not green enough — timer reset")
+            first_detected = None
+            continue
+
+        results = model(frame, imgsz=PLANT_IMGSZ, verbose=False)
+        result  = results[0]
+
+        if result.probs is None:
+            continue
+
+        top1_idx  = int(result.probs.top1)
+        top1_conf = float(result.probs.top1conf)
+        label     = result.names[top1_idx]
+
+        now = time.time()
+
+        if top1_conf < PLANT_CONF_DISPLAY:
+            if first_detected is not None:
+                print("[plant] Low conf — timer reset")
+            first_detected = None
+            continue
+
+        # Draw label banner on top of the current annotated frame
+        with _annotated_lock:
+            base = _annotated.copy() if _annotated is not None else frame.copy()
+
+        clean = label.replace("___", " ").replace("_", " ")
+        text  = f"{clean}  {top1_conf:.0%}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+        cv2.rectangle(base, (8, 8), (8 + tw + 10, 8 + th + 12), (0, 0, 0), -1)
+        cv2.putText(base, text, (13, 8 + th + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 60), 2)
+
+        with _annotated_lock:
+            _annotated = base
+
+        if top1_conf < CONF_UPLOAD:
+            first_detected = None
+            continue
+
+        if first_detected is None:
+            first_detected = now
+            print(f"[plant] Detected {label} {top1_conf:.0%} — confirming...")
+
+        elapsed = now - first_detected
+        if elapsed >= CONFIRM_SECS and (now - last_uploaded) >= SAVE_COOLDOWN:
+            print(f"[plant] Confirmed {elapsed:.1f}s — uploading...")
+            threading.Thread(
+                target=upload_to_firebase,
+                args=("plant", label, top1_conf, frame, None),
+                daemon=True,
+            ).start()
+            last_uploaded  = now
+            first_detected = None
+        elif elapsed < CONFIRM_SECS:
+            print(f"[plant] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s")
