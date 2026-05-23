@@ -17,11 +17,12 @@ CONFIRM_SECS  = 2.0
 SAVE_COOLDOWN = 30.0
 
 # ── Fire model (object detection, 640px) ──────────────────────────
-FIRE_CONF_DISPLAY = 0.40   # raised from 0.25 — filters out low-conf background hits
+FIRE_CONF_DISPLAY = 0.35   # show box at this confidence
 FIRE_IMGSZ        = 640
 FIRE_IGNORE       = {"default"}
 FIRE_MAX_AREA     = 0.65   # reject boxes covering > 65% of frame (background walls)
-FIRE_EDGE_MARGIN  = 5      # reject boxes that bleed from the frame edge
+FIRE_EDGE_MARGIN  = 2      # reject boxes that bleed from the very frame edge
+FIRE_STICKY_FRAMES = 6     # keep showing last box for N frames after detection lost
 
 # ── Plant model (classification, 256px) ───────────────────────────
 PLANT_CONF_DISPLAY = 0.60
@@ -87,9 +88,11 @@ def _fire_worker():
     model = YOLO(str(MODEL_FIRE))
     print(f"[fire] Ready. Classes: {list(model.names.values())}")
 
-    last_seen_id   = -1
-    first_detected = None
-    last_uploaded  = 0.0
+    last_seen_id    = -1
+    first_detected  = None
+    last_uploaded   = 0.0
+    missed_frames   = 0      # frames since last valid detection
+    last_best_box   = None   # last confirmed best box for sticky display
 
     while not _stop.is_set():
         with _raw_lock:
@@ -101,31 +104,40 @@ def _fire_worker():
             continue
         last_seen_id = fid
 
-        fh, fw    = frame.shape[:2]
+        fh, fw     = frame.shape[:2]
         frame_area = fw * fh
 
         results = model(frame, conf=FIRE_CONF_DISPLAY, imgsz=FIRE_IMGSZ, verbose=False)
         result  = results[0]
 
-        boxes_data = []
+        valid = []
         for box in result.boxes:
             cls_id = int(box.cls[0])
             label  = result.names[cls_id]
             if label.lower() in FIRE_IGNORE:
                 continue
-
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
-
-            # Reject boxes covering most of the frame (walls, background)
             if (x2 - x1) * (y2 - y1) / frame_area > FIRE_MAX_AREA:
                 continue
-
-            # Reject boxes that bleed in from the frame edge
             if x1 <= FIRE_EDGE_MARGIN or x2 >= (fw - FIRE_EDGE_MARGIN):
                 continue
+            valid.append([x1, y1, x2, y2, label, conf])
 
-            boxes_data.append([x1, y1, x2, y2, label, conf])
+        if valid:
+            # Show only the single highest-confidence box — cleaner display
+            best_box     = max(valid, key=lambda b: b[5])
+            last_best_box = best_box
+            missed_frames = 0
+            boxes_data    = [best_box]
+        else:
+            missed_frames += 1
+            # Keep the last box visible for FIRE_STICKY_FRAMES to absorb movement
+            if missed_frames <= FIRE_STICKY_FRAMES and last_best_box is not None:
+                boxes_data = [last_best_box]
+            else:
+                boxes_data    = []
+                last_best_box = None
 
         with _fire_alock:
             _fire_boxes.clear()
@@ -133,13 +145,18 @@ def _fire_worker():
 
         now = time.time()
 
-        if not boxes_data:
+        # Only reset timer once sticky buffer is exhausted
+        if not valid and missed_frames > FIRE_STICKY_FRAMES:
             if first_detected is not None:
                 print("[fire] Lost — timer reset")
             first_detected = None
             continue
 
-        best = max(boxes_data, key=lambda b: b[5])
+        if not valid:
+            # Still in sticky window — don't advance the timer
+            continue
+
+        best = max(valid, key=lambda b: b[5])
         x1, y1, x2, y2, best_label, best_conf = best
         bbox = [x1, y1, x2, y2]
 
