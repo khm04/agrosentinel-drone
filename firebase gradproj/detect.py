@@ -12,39 +12,38 @@ MODEL_FIRE  = SCRIPT_DIR / "models" / "fire_best.pt"
 MODEL_PLANT = SCRIPT_DIR / "models" / "plant_best.pt"
 
 # ── Upload thresholds ──────────────────────────────────────────────
-CONF_UPLOAD   = 0.80   # minimum confidence to trigger Firebase upload
-CONFIRM_SECS  = 2.0    # seconds detection must hold before uploading
-SAVE_COOLDOWN = 30.0   # seconds between uploads for the same model
+CONF_UPLOAD   = 0.80
+CONFIRM_SECS  = 2.0
+SAVE_COOLDOWN = 30.0
 
 # ── Fire model (object detection, 640px) ──────────────────────────
-FIRE_CONF_DISPLAY = 0.25
+FIRE_CONF_DISPLAY = 0.40   # raised from 0.25 — filters out low-conf background hits
 FIRE_IMGSZ        = 640
 FIRE_IGNORE       = {"default"}
+FIRE_MAX_AREA     = 0.65   # reject boxes covering > 65% of frame (background walls)
+FIRE_EDGE_MARGIN  = 5      # reject boxes that bleed from the frame edge
 
 # ── Plant model (classification, 256px) ───────────────────────────
 PLANT_CONF_DISPLAY = 0.60
 PLANT_IMGSZ        = 256
-PLANT_GREEN_THRESH = 0.08   # minimum green pixel ratio to run plant model
+PLANT_GREEN_THRESH = 0.08
 
-# ── GPS (replace with real GPS module when ready) ─────────────────
+# ── GPS ────────────────────────────────────────────────────────────
 GPS_LAT = 32.0123
 GPS_LNG = 36.1234
 
 # ── Shared: raw camera frame ──────────────────────────────────────
-# Main thread writes; workers read. Workers copy immediately under lock
-# so inference runs outside the lock.
 _raw_frame    = None
 _raw_frame_id = 0
 _raw_lock     = threading.Lock()
 
 # ── Shared: annotation data (workers write, main draws) ───────────
-# Workers store the RESULT of inference as plain data.
-# Main thread draws this data onto the fresh live frame each cycle.
-# This is what keeps the camera live and boxes tracking.
 _fire_boxes  = []      # list of [x1, y1, x2, y2, label, conf]
 _fire_alock  = threading.Lock()
 
-_plant_state = [None]  # [0] = (label, conf) or None
+# [0] = (label, conf, veg_bbox) or None
+# veg_bbox = (x1, y1, x2, y2) of largest green region, or None
+_plant_state = [None]
 _plant_alock = threading.Lock()
 
 _stop = threading.Event()
@@ -81,7 +80,7 @@ def upload_to_firebase(model_name, label, confidence, frame, bbox):
 
 
 # ─────────────────────────────────────────────────────────────────
-# FIRE WORKER  (object detection — has bounding boxes)
+# FIRE WORKER
 # ─────────────────────────────────────────────────────────────────
 def _fire_worker():
     print("[fire] Loading model...")
@@ -102,6 +101,9 @@ def _fire_worker():
             continue
         last_seen_id = fid
 
+        fh, fw    = frame.shape[:2]
+        frame_area = fw * fh
+
         results = model(frame, conf=FIRE_CONF_DISPLAY, imgsz=FIRE_IMGSZ, verbose=False)
         result  = results[0]
 
@@ -111,11 +113,20 @@ def _fire_worker():
             label  = result.names[cls_id]
             if label.lower() in FIRE_IGNORE:
                 continue
+
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
+
+            # Reject boxes covering most of the frame (walls, background)
+            if (x2 - x1) * (y2 - y1) / frame_area > FIRE_MAX_AREA:
+                continue
+
+            # Reject boxes that bleed in from the frame edge
+            if x1 <= FIRE_EDGE_MARGIN or x2 >= (fw - FIRE_EDGE_MARGIN):
+                continue
+
             boxes_data.append([x1, y1, x2, y2, label, conf])
 
-        # Store annotation data — main thread draws it on the live frame
         with _fire_alock:
             _fire_boxes.clear()
             _fire_boxes.extend(boxes_data)
@@ -132,13 +143,10 @@ def _fire_worker():
         x1, y1, x2, y2, best_label, best_conf = best
         bbox = [x1, y1, x2, y2]
 
-        # Start timer when detection first appears; keep it running even if
-        # confidence dips briefly below CONF_UPLOAD — only reset on total loss.
         if first_detected is None:
             first_detected = now
             print(f"[fire] Detected {best_label} {best_conf:.0%} — confirming...")
 
-        # Only upload if confidence is above threshold at the moment of upload
         if best_conf < CONF_UPLOAD:
             elapsed = now - first_detected
             print(f"[fire] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s (conf {best_conf:.0%})")
@@ -159,7 +167,7 @@ def _fire_worker():
 
 
 # ─────────────────────────────────────────────────────────────────
-# PLANT WORKER  (classification — NO bounding boxes)
+# PLANT WORKER
 # ─────────────────────────────────────────────────────────────────
 def _plant_worker():
     print("[plant] Loading model...")
@@ -180,7 +188,7 @@ def _plant_worker():
             continue
         last_seen_id = fid
 
-        # Vegetation gate — only classify if scene is green enough
+        # Vegetation gate
         hsv         = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         green_mask  = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
         green_ratio = green_mask.sum() / 255 / (frame.shape[0] * frame.shape[1])
@@ -192,6 +200,15 @@ def _plant_worker():
                 print("[plant] Not green enough — timer reset")
             first_detected = None
             continue
+
+        # Find bounding box of largest green region to show on display
+        contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        veg_bbox = None
+        if contours:
+            largest  = max(contours, key=cv2.contourArea)
+            gx, gy, gw, gh = cv2.boundingRect(largest)
+            veg_bbox = (gx, gy, gx + gw, gy + gh)
 
         results = model(frame, imgsz=PLANT_IMGSZ, verbose=False)
         result  = results[0]
@@ -213,12 +230,9 @@ def _plant_worker():
             first_detected = None
             continue
 
-        # Store annotation data — main thread draws it on the live frame
         with _plant_alock:
-            _plant_state[0] = (label, top1_conf)
+            _plant_state[0] = (label, top1_conf, veg_bbox)
 
-        # Start timer when detection first appears; keep it running even if
-        # confidence dips briefly below CONF_UPLOAD — only reset on total loss.
         if first_detected is None:
             first_detected = now
             print(f"[plant] Detected {label} {top1_conf:.0%} — confirming...")
@@ -246,6 +260,7 @@ def _plant_worker():
 # DRAW  — called by main on a fresh frame every cycle
 # ─────────────────────────────────────────────────────────────────
 def _draw(frame):
+    # Fire: red bounding boxes
     with _fire_alock:
         boxes = list(_fire_boxes)
 
@@ -255,11 +270,19 @@ def _draw(frame):
                     (x1, max(y1 - 8, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 60, 255), 2)
 
+    # Plant: green box around detected vegetation + label banner
     with _plant_alock:
         plant = _plant_state[0]
 
     if plant is not None:
-        label, conf = plant
+        label, conf, veg_bbox = plant
+
+        # Green box around the plant region
+        if veg_bbox is not None:
+            px1, py1, px2, py2 = veg_bbox
+            cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 200, 60), 2)
+
+        # Label banner top-left
         clean = label.replace("___", " ").replace("_", " ")
         text  = f"{clean}  {conf:.0%}"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
@@ -303,9 +326,7 @@ def main():
             _raw_frame     = frame.copy()
             _raw_frame_id += 1
 
-        # Draw latest annotation data onto the fresh live frame
         _draw(frame)
-
         cv2.imshow("AgroSentinel", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
